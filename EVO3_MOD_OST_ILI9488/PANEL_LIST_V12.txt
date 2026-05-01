@@ -1,0 +1,31 @@
+0 Boot
+1 Main Radio
+2 Radio Info
+3 VU Boomerang
+4 VU Analog
+5 VU Crystal
+6 VU Wing
+7 Clock
+8 Volume
+9 Station List
+10 Bank List
+11 Station Info
+12 Equalizer
+13 FFT
+14 Advanced Analyzer
+15 Bluetooth Player
+16 Bluetooth Settings
+17 SD Player
+18 SD Recorder
+19 File Browser
+20 WiFi WebUI
+21 OTA
+22 Sleep Timer
+23 Station Search
+24 Favorites
+25 Settings
+26 System Monitor
+27 Alert
+28 Power Off
+29 Recovery
+30 About

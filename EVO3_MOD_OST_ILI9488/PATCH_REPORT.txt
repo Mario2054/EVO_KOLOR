@@ -1,0 +1,15 @@
+Patched files:
+src/APMS_GraphicEQ16.cpp
+src/EQ_AnalyzerDisplay.cpp
+src/SDPlayer/EXAMPLE_INTEGRATION_SNIPPET.cpp
+src/SDPlayer/SDPlayerAdvanced.cpp
+src/SDPlayer/SDPlayerAdvanced.h
+src/SDPlayer/SDPlayerManager.cpp
+src/SDPlayer/SDPlayerManager.h
+src/SDPlayer/SDPlayerOLED.cpp
+src/SDPlayer/SDPlayerOLED.h
+src/SDPlayer/SDPlayerWebUI.cpp
+src/vu_style11.cpp
+src/vu_style11.h
+src/wifi_animation.cpp
+src/wifi_animation.h

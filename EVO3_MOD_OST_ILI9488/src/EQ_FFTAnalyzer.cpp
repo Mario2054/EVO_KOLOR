@@ -1,0 +1,473 @@
+#include "EQ_FFTAnalyzer.h"
+#include "EQ_AnalyzerDisplay.h"  // for analyzerGetPeakHoldTime()
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
+#include <math.h>
+#include <string.h>
+
+// ======================= USTAWIENIA (lekkie, bez wpływu na audio) =======================
+
+// Rozmiar ramki do analizy – 256 próbek (mono) daje szybki refresh i mały koszt.
+static const uint16_t FRAME_N = 256;
+
+// Downsample: dla 44.1kHz/48kHz bierzemy co 2 próbkę do analizy -> mniej CPU.
+// (Skuteczny samplerate = SR / DS)
+static uint8_t g_downsample = 2;
+
+// Kolejka próbek: trzymamy tylko mono int16
+typedef struct {
+  int16_t s[FRAME_N];
+  uint16_t n; // zawsze FRAME_N jeśli pełna ramka
+} frame_t;
+
+static QueueHandle_t g_q = nullptr;
+static TaskHandle_t  g_task = nullptr;
+
+// Kontrola częstotliwości update (20Hz - zoptymalizowane dla FLAC streaming)
+static uint32_t g_lastUIUpdateMs = 0;
+static uint32_t g_uiUpdateIntervalMs = 50; // ~20Hz update rate (oszczędność CPU dla audio)
+static uint32_t g_droppedFrames = 0;
+// FLAC dekoduje bloki do 4608 próbek → po ds=2 → ~9 ramek 256-próbkowych per blok.
+// Kolejka 24 ramek = ~2.7s bufora; drop threshold 8 zapobiega zamrożeniu analizatora.
+static const uint8_t g_maxQueueLength = 8;  // próg drop dla adaptacyjnego upuszczania
+
+static volatile bool g_enabled = false;
+static volatile bool g_runtimeActive = false;
+static volatile bool g_testGen = false;
+static volatile bool g_flac_mode = false;
+static volatile bool g_sdplayer_mode = false; // Tryb SDPlayer - 3x większa dynamika
+static uint8_t g_max_valid_band = EQ_BANDS;   // maks. pasmo < Nyquist (antyaliasing)
+
+static volatile uint32_t g_sr_hz = 44100;         // wejściowy SR
+static volatile uint32_t g_sr_eff = 22050;        // efektywny SR po downsample
+
+// Współczynniki dynamiki/AGC (klucz do "żywego" analizatora bez przesteru)
+static float g_ref = 1800.0f;     // adaptacyjna referencja energii (AGC) - wyższa dla kontroli basów
+static float g_ref_min = 150.0f;  // minimalna referencja (gating)
+static float g_ref_max = 8000.0f; // maksymalna referencja - wyższa dla głośnych fragmentów
+
+// Wygładzanie słupków i peak-hold
+static float g_levels[EQ_BANDS] = {0};
+static float g_peaks [EQ_BANDS] = {0};
+static uint32_t g_peak_timers[EQ_BANDS] = {0}; // timery peak hold w ms
+
+// Statystyka: czy naprawdę dostajemy próbki
+static volatile uint64_t g_lastPushUs = 0;
+static volatile uint32_t g_samplesPushed = 0;
+static volatile uint32_t g_samplesPushedPrev = 0;
+
+// snapshot lock (bardzo lekki)
+static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Bufor do składania ramki
+static int16_t g_acc[FRAME_N];
+static uint16_t g_acc_n = 0;
+static uint8_t  g_ds_phase = 0;
+
+// ======================= GOERTZEL (tanie "FFT-like" na pasma) =======================
+
+static inline float clamp01(float x){ return (x < 0.f) ? 0.f : (x > 1.f ? 1.f : x); }
+
+// 16 pasm – logarytmicznie (od ~60 Hz do ~12 kHz przy 22.05 kHz eff)
+static const float kBandHz[EQ_BANDS] = {
+   60,   90,  140,  220,
+  330,  500,  750, 1100,
+ 1600, 2300, 3300, 4700,
+ 6600, 8200, 9800, 12000
+};
+
+// Zbalansowane tłumienie z bardzo mocno podbitymi wysokimi częstotliwościami
+static const float kBandGain[EQ_BANDS] = {
+  0.35f, 0.45f, 0.55f, 0.65f,  // Umiarkowanie tłumione basy (60-220Hz)
+  0.75f, 1.10f, 1.20f, 1.15f,  // Podbite średnie częst. (330Hz-1.1kHz)
+  1.35f, 1.50f, 1.65f, 1.70f,  // Bardzo mocno podbite wyższe częst. (1.6-4.7kHz)  
+  1.75f, 1.80f, 1.85f, 1.90f   // Maksymalnie podbite najwyższe (6.6-12kHz)
+};
+
+// Pre-computed Goertzel coefficients (2*cos(2π*f/sr_eff)) – przeliczane przy init i zmianie SR
+static float g_goertzel_coeff[EQ_BANDS] = {0};
+
+static void compute_goertzel_coeffs(void){
+  for(uint8_t b = 0; b < EQ_BANDS; b++){
+    const float w = 2.0f * (float)M_PI * (kBandHz[b] / (float)g_sr_eff);
+    g_goertzel_coeff[b] = 2.0f * cosf(w);
+  }
+}
+
+static float goertzel_mag(const int16_t* x, uint16_t n, float coeff){
+  float q0=0, q1=0, q2=0;
+  for(uint16_t i=0;i<n;i++){
+    q0 = coeff*q1 - q2 + (float)x[i];
+    q2 = q1;
+    q1 = q0;
+  }
+  float p = q1*q1 + q2*q2 - q1*q2*coeff;
+  if(p < 0) p = 0;
+  return p;
+}
+
+// ======================= Mapowanie energii -> poziom (dynamika) =======================
+
+static float compress_level(float v, float comp){
+  float y = log1pf(comp * v) / log1pf(comp);
+  return clamp01(y);
+}
+
+// ======================= TASK ANALIZATORA (Core1) =======================
+
+static void analyzer_task(void*){
+  frame_t fr;
+  const TickType_t waitTicks = pdMS_TO_TICKS(g_uiUpdateIntervalMs); // 30-40Hz
+
+  // parametry "fizyki" słupków (style 5/6)
+  const float attack = 0.85f;      // bardzo szybko rośnie (5x przyspieszone)
+  const float release = 0.40f;     // szybciej opada (5x przyspieszone) 
+  const float peakFall = 0.060f;   // szybsze opadanie peak-hold (5x przyspieszone)
+
+  while(true){
+    // gdy OFF lub nieaktywny runtime -> śpimy, nie dotykamy CPU
+    if(!g_enabled || !g_runtimeActive){
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // Drop old frames jeśli kolejka przepełniona (adaptive load)
+    UBaseType_t queueLength = uxQueueMessagesWaiting(g_q);
+    if(queueLength > g_maxQueueLength) {
+      // Drop wszystkie stare ramki oprócz najnowszej
+      while(queueLength > 1 && xQueueReceive(g_q, &fr, 0) == pdTRUE) {
+        g_droppedFrames++;
+        queueLength--;
+      }
+    }
+    
+    if(xQueueReceive(g_q, &fr, waitTicks) != pdTRUE){
+      // brak ramki – luz
+      continue;
+    }
+    
+    // Kontrola częstotliwości update UI (30-40Hz)
+    uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if((nowMs - g_lastUIUpdateMs) < g_uiUpdateIntervalMs) {
+      continue; // Zbyt wcześnie na update UI
+    }
+    g_lastUIUpdateMs = nowMs;
+
+    // 1) policz energię globalną ramki (ref/AGC)
+    float sumAbs = 0.f;
+    for(uint16_t i=0;i<FRAME_N;i++){
+      sumAbs += fabsf((float)fr.s[i]);
+    }
+    float refNow = (sumAbs / (float)FRAME_N);
+
+    // Cache volatile flags raz na ramkę – eliminuje ~36 odczytów DRAM (g_flac_mode/g_sdplayer_mode volatile)
+    const bool  flac_now     = g_flac_mode;
+    const bool  sdpl_now     = g_sdplayer_mode;
+    const float attack_rate  = flac_now ? 0.25f   : 0.20f;
+    const float release_rate = flac_now ? 0.08f   : 0.05f;
+    const float ref_min      = flac_now ? 100.0f  : g_ref_min;
+    const float ref_max      = flac_now ? 12000.0f: g_ref_max;
+    const float comp_factor  = flac_now ? 12.0f   : 8.0f;
+    const float dyn_scale    = sdpl_now ? 73.0f   : (flac_now ? 320.0f : 220.0f);
+
+    // AGC
+    if(refNow > g_ref) g_ref = g_ref + attack_rate*(refNow - g_ref);
+    else               g_ref = g_ref + release_rate*(refNow - g_ref);
+    if(g_ref < ref_min) g_ref = ref_min;
+    if(g_ref > ref_max) g_ref = ref_max;
+
+    // 2) pasma – goertzel
+    float raw[EQ_BANDS];
+    for(uint8_t b=0;b<EQ_BANDS;b++){
+      float p = goertzel_mag(fr.s, FRAME_N, g_goertzel_coeff[b]);
+      float mag = sqrtf(p);
+      float v = (mag / (g_ref * dyn_scale)) * kBandGain[b];
+      raw[b] = compress_level(v, comp_factor);
+    }
+    // Zeruj pasma powyżej Nyquista – Goertzel przy f >= SR/2 jest niestabilny
+    for(uint8_t b = g_max_valid_band; b < EQ_BANDS; b++) raw[b] = 0.0f;
+
+    // 3) wygładzanie + peak hold
+    const uint32_t peakHoldMs = analyzerGetPeakHoldTime(); // Odczytaj aktualną wartość w każdej iteracji
+        // Debug: wypisz peakHoldMs co 5 sekund
+    static uint32_t lastDebugMs = 0;
+    if((nowMs - lastDebugMs) > 5000) {
+      // Serial.printf("DEBUG FFT: peakHoldMs = %u\n", peakHoldMs); // Debug disabled
+      lastDebugMs = nowMs;
+    }
+        portENTER_CRITICAL(&g_mux);
+    for(uint8_t b=0;b<EQ_BANDS;b++){
+      float cur = g_levels[b];
+      float target = raw[b];
+
+      // attack/release
+      if(target > cur) cur = cur + attack*(target - cur);
+      else             cur = cur + release*(target - cur);
+
+      cur = clamp01(cur);
+      g_levels[b] = cur;
+
+      // peaks z hold time
+      float pk = g_peaks[b];
+      uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+      
+      if(cur > pk) {
+        // Nowy peak - ustaw wartość i zresetuj timer
+        pk = cur;
+        g_peak_timers[b] = now_ms;
+      } else {
+        // Sprawdź czy peak hold time minął
+        if((now_ms - g_peak_timers[b]) > peakHoldMs) {
+          // Hold time minął - zaczynaj opadanie
+          pk -= peakFall;
+          if(pk < cur) pk = cur; // nie opadaj poniżej aktualnego poziomu
+        }
+        // Jeśli hold time jeszcze nie minął, pk zostaje bez zmian
+      }
+      
+      if(pk < 0) pk = 0;
+      g_peaks[b] = pk;
+    }
+    portEXIT_CRITICAL(&g_mux);
+  }
+}
+
+// ======================= API =======================
+
+bool eq_analyzer_init(void){
+  if(g_q) return true;
+
+  g_q = xQueueCreate(24, sizeof(frame_t)); // 24 ramek: bufor na pełny burst FLAC (~2.7s @ 44.1kHz/ds2)
+  if(!g_q) return false;
+
+  compute_goertzel_coeffs();
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    analyzer_task,
+    "EQAnalyzer",
+    6144,          // stack
+    nullptr,
+    1,             // niski priorytet
+    &g_task,
+    1              // Core1 (Core0 zostaje dla audio)
+  );
+  if(ok != pdPASS){
+    vQueueDelete(g_q);
+    g_q = nullptr;
+    return false;
+  }
+
+  eq_analyzer_reset();
+  return true;
+}
+
+void eq_analyzer_deinit(void){
+  if(g_task){
+    vTaskDelete(g_task);
+    g_task = nullptr;
+  }
+  if(g_q){
+    vQueueDelete(g_q);
+    g_q = nullptr;
+  }
+}
+
+void eq_analyzer_reset(void){
+  portENTER_CRITICAL(&g_mux);
+  for(uint8_t i=0;i<EQ_BANDS;i++){
+    g_levels[i]=0;
+    g_peaks[i]=0;
+  }
+  portEXIT_CRITICAL(&g_mux);
+  g_ref = 1200.0f;
+  g_lastPushUs = 0;
+  g_samplesPushed = 0;
+  g_samplesPushedPrev = 0;
+  g_acc_n = 0;
+  g_ds_phase = 0;
+}
+
+void eq_analyzer_set_enabled(bool en){
+  g_enabled = en;
+  if(!en){
+    eq_analyzer_reset();
+    // opróżnij kolejkę
+    if(g_q) xQueueReset(g_q);
+  }
+}
+bool eq_analyzer_get_enabled(void){ return g_enabled; }
+bool eq_analyzer_get_runtime_active(void){ return g_runtimeActive; }
+QueueHandle_t eq_analyzer_get_queue(void){ return g_q; }
+
+void eq_analyzer_set_runtime_active(bool active){
+  g_runtimeActive = active;
+  if(!active){
+    // żeby nie wisiały stare wartości
+    portENTER_CRITICAL(&g_mux);
+    for(uint8_t i=0;i<EQ_BANDS;i++){
+      g_levels[i] *= 0.7f;
+      g_peaks[i]  *= 0.7f;
+    }
+    portEXIT_CRITICAL(&g_mux);
+  }
+}
+
+void eq_analyzer_set_sample_rate(uint32_t sample_rate_hz){
+  if(sample_rate_hz < 8000) sample_rate_hz = 8000;
+  g_sr_hz = sample_rate_hz;
+
+  // downsample: dla 44.1/48k -> 2, dla 96k -> 4
+  if(sample_rate_hz >= 88000) g_downsample = 4;
+  else if(sample_rate_hz >= 32000) g_downsample = 2;
+  else g_downsample = 1;
+
+  g_sr_eff = sample_rate_hz / g_downsample;
+  // Wyznacz maks. pasmo < Nyquist (Goertzel przy f >= SR/2 jest niestabilny)
+  const float nyquist = (float)g_sr_eff * 0.5f;
+  uint8_t max_band = 0;
+  while(max_band < EQ_BANDS && kBandHz[max_band] < nyquist) max_band++;
+  g_max_valid_band = max_band;
+  compute_goertzel_coeffs();
+}
+
+void eq_analyzer_push_samples_i16(const int16_t* interleavedLR, uint32_t frames){
+  // UWAGA: ta funkcja leci z audio path – zero printów, zero malloc, zero heavy math.
+  if(!g_enabled) { return; }
+  if(!g_q) { return; }
+
+  // mono = (L+R)/2, downsample
+  for(uint32_t i=0;i<frames;i++){
+    if(g_downsample > 1){
+      if(g_ds_phase++ < (g_downsample-1)) continue;
+      g_ds_phase = 0;
+    }
+
+    // ZAWSZE inkrementuj licznik – is_receiving_samples() musi działać
+    // nawet zanim display aktywuje runtime (jak w starej bibliotece)
+    uint32_t temp = g_samplesPushed;
+    g_samplesPushed = temp + 1;
+
+    // Przetwarzaj FFT tylko gdy runtime aktywny (oszczędność CPU)
+    if(!g_runtimeActive && !g_testGen) continue;
+
+    int32_t L = interleavedLR[i*2 + 0];
+    int32_t R = interleavedLR[i*2 + 1];
+    
+    // 2% wzmocnienia na wejściu analizatora
+    int32_t mono32 = ((L + R) / 2) * 102 / 100; // 1.02x wzmocnienie
+    
+    // Zabezpieczenie przed przepełnieniem
+    if (mono32 > 32767) mono32 = 32767;
+    else if (mono32 < -32768) mono32 = -32768;
+    
+    int16_t m = (int16_t)mono32;
+
+    g_acc[g_acc_n++] = m;
+
+    if(g_acc_n >= FRAME_N){
+      frame_t fr;
+      memcpy(fr.s, g_acc, sizeof(g_acc));
+      fr.n = FRAME_N;
+      g_acc_n = 0;
+
+      // non-blocking send – jak kolejka pełna, wyrzucamy (bez wpływu na audio)
+      // Jeśli kolejka pełna, nie blokujemy - audio path ma priorytet
+      if(xQueueSend(g_q, &fr, 0) != pdTRUE) {
+        g_droppedFrames++; // Statystyka dropped frames
+      }
+      g_lastPushUs = (uint64_t)esp_timer_get_time();
+    }
+  }
+}
+
+void eq_get_analyzer_levels(float out_levels[EQ_BANDS]){
+  portENTER_CRITICAL(&g_mux);
+  memcpy(out_levels, g_levels, sizeof(float)*EQ_BANDS);
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void eq_get_analyzer_peaks(float out_peaks[EQ_BANDS]){
+  portENTER_CRITICAL(&g_mux);
+  memcpy(out_peaks, g_peaks, sizeof(float)*EQ_BANDS);
+  portEXIT_CRITICAL(&g_mux);
+}
+
+bool eq_analyzer_is_receiving_samples(void){
+  // czy w ostatniej 1.2s były próbki
+  uint64_t now = (uint64_t)esp_timer_get_time();
+  bool recent = (g_lastPushUs != 0) && ((now - g_lastPushUs) < 1200000ULL);
+
+  // czy sample count rośnie
+  uint32_t cur = g_samplesPushed;
+  bool inc = (cur != g_samplesPushedPrev);
+  g_samplesPushedPrev = cur;
+
+  // wynik: recent OR inc (bo przy ciszy ramki mogą się rzadziej składać)
+  return recent || inc;
+}
+
+void eq_analyzer_print_diagnostics(void){
+  Serial.printf("EQ Analyzer: en=%d runtime=%d sr=%u eff=%u ds=%u ref=%.1f q=%u acc=%u samples=%u\n",
+    (int)g_enabled, (int)g_runtimeActive, (unsigned)g_sr_hz, (unsigned)g_sr_eff, (unsigned)g_downsample,
+    g_ref,
+    g_q ? (unsigned)uxQueueMessagesWaiting(g_q) : 0,
+    (unsigned)g_acc_n,
+    (unsigned)g_samplesPushed
+  );
+}
+
+void eq_analyzer_enable_test_generator(bool en){
+  g_testGen = en;
+  // generator prosty: nie implementuję tu, bo to by dodało kod w audio path.
+  // Jeśli chcesz – dopiszemy wersję generującą ramki w analyzer_task (bez audio hook).
+}
+
+// ======================= NOWE FUNKCJE OPTYMALIZACJI =======================
+
+uint32_t eq_analyzer_get_dropped_frames(void){
+  return g_droppedFrames;
+}
+
+void eq_analyzer_reset_stats(void){
+  g_droppedFrames = 0;
+  g_samplesPushed = 0;
+  g_samplesPushedPrev = 0;
+}
+
+uint32_t eq_analyzer_get_queue_length(void){
+  if(!g_q) return 0;
+  return (uint32_t)uxQueueMessagesWaiting(g_q);
+}
+
+void eq_analyzer_set_update_rate(uint32_t hz){
+  if(hz < 20) hz = 20;   // minimum 20Hz  
+  if(hz > 60) hz = 60;   // maximum 60Hz
+  g_uiUpdateIntervalMs = 1000 / hz;
+}
+
+float eq_analyzer_get_cpu_load(void){
+  // Proste oszacowanie na podstawie dropped frames
+  if(g_samplesPushed == 0) return 0.0f;
+  return (float)g_droppedFrames / (float)(g_samplesPushed + g_droppedFrames) * 100.0f;
+}
+
+void eq_analyzer_set_flac_mode(bool enable) {
+  g_flac_mode = enable;
+  // Reset analizatora przy zmianie trybu
+  if(enable) {
+    Serial.println("[FFT ANALYZER] FLAC mode enabled - increased dynamics");
+  } else {
+    Serial.println("[FFT ANALYZER] Standard mode enabled");
+  }
+}
+
+void eq_analyzer_set_sdplayer_mode(bool enable) {
+  g_sdplayer_mode = enable;
+  if(enable) {
+    Serial.println("[FFT ANALYZER] SDPlayer mode enabled - 3x dynamics boost");
+  } else {
+    Serial.println("[FFT ANALYZER] SDPlayer mode disabled");
+  }
+}
