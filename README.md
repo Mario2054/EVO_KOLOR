@@ -1,5 +1,12 @@
 # EVO 3.20.04
-Podłaczenie do ESP32 S3 N16 R8 // -------------- OLED Wyswietlacz - definicja pinow -------------- #define SPI_MOSI_OLED 39 // Pin MOSI (Master Out Slave In) dla interfejsu SPI OLED #define SPI_MISO_OLED -1 // brak MISO dla wyswietlacza TFT #define SPI_SCK_OLED 38 // Pin SCK (Serial Clock) dla interfejsu SPI OLED #define CS_OLED -1 // CS ekranu szczątkowego do GND - kości na ILI9488 #define DC_OLED 40 // DC/RS ekran ILI9488 #define RESET_OLED 41 // RST ekran ILI9488
+Podłaczenie do ESP32 S3 N16 R8 
+OLED Wyswietlacz - TFT 
+SPI_MOSI_OLED 39 // Pin MOSI (Master Out Slave In) dla interfejsu SPI OLED 
+SPI_MISO_OLED -1 // brak MISO dla wyswietlacza TFT 
+SPI_SCK_OLED 38 // Pin SCK (Serial Clock) dla interfejsu SPI OLED 
+CS_OLED -1 // CS ekranu szczątkowego do GND - kości na ILI9488 
+DC_OLED 40 // DC/RS ekran ILI9488 ST7796
+RESET_OLED 41 // RST ekran ILI9488  ST7796
 
 <img width="1824" height="1025" alt="image" src="https://github.com/user-attachments/assets/ace4621f-0c0a-4fc7-8f04-c03e797b8897" />
 
