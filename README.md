@@ -15,6 +15,10 @@ RESET_OLED 41 // RST ekran ILI9488  ST7796
 <img width="1095" height="831" alt="image" src="https://github.com/user-attachments/assets/8f8d94d7-67c6-4a86-870b-ded41dcffe9c" />
 <img width="918" height="252" alt="image" src="https://github.com/user-attachments/assets/ddfc121c-c3f0-46a5-968c-5dfb59f98651" />
 <img width="728" height="912" alt="image" src="https://github.com/user-attachments/assets/71d4d610-f129-4fd4-a367-41cc947d3255" />
+<img width="1497" height="695" alt="image" src="https://github.com/user-attachments/assets/e16cdf7c-bf61-4c91-be66-11e2299173ec" />
+<img width="1683" height="676" alt="image" src="https://github.com/user-attachments/assets/920b6fb1-40e3-445c-9c92-b30ddce60abe" />
+
+
 
 
 
