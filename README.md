@@ -1,4 +1,4 @@
-# EVO 4 MULTI.22.04
+# EVO 4 MULTI.22.01
 Podłaczenie do ESP32 S3 N16 R8 
 OLED Wyswietlacz - TFT 
 SPI_MOSI_OLED 39 // Pin MOSI (Master Out Slave In) dla interfejsu SPI OLED 
